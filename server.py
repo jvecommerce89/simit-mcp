@@ -245,14 +245,68 @@ async def endpoint_mensajes(request: Request):
 @app.post("/sse")
 async def endpoint_sse_post(request: Request):
     """
-    GPTmaker valida el servidor haciendo POST /sse.
-    Lo redirigimos al handler de mensajes para que funcione correctamente.
+    GPTmaker valida el servidor haciendo POST /sse con JSON-RPC.
+    Respondemos directamente con JSON-RPC sin pasar por el SSE handler
+    (que causaba error ASGI de doble respuesta).
     """
-    await sse.handle_post_message(
-        request.scope,
-        request.receive,
-        request._send
-    )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+            status_code=200
+        )
+
+    method = body.get("method", "")
+    req_id = body.get("id", 1)
+
+    # GPTmaker primero hace "initialize" para verificar el protocolo MCP
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "simit-movilegal", "version": "1.0"}
+            }
+        })
+
+    # Luego consulta las herramientas disponibles
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "consultar_simit",
+                        "description": (
+                            "Consulta comparendos, multas e infracciones de tránsito en SIMIT Colombia. "
+                            "Úsala cuando el cliente proporcione su número de cédula de ciudadanía o la placa "
+                            "de su vehículo para verificar si tiene multas o comparendos pendientes de pago."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "documento": {
+                                    "type": "string",
+                                    "description": (
+                                        "Número de cédula de ciudadanía o placa del vehículo. "
+                                        "Ejemplos: '1049615965' o 'KWX584'"
+                                    )
+                                }
+                            },
+                            "required": ["documento"]
+                        }
+                    }
+                ]
+            }
+        })
+
+    # Cualquier otro método — respuesta vacía válida
+    else:
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 
 @app.get("/health")
