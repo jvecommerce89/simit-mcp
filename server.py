@@ -12,6 +12,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
@@ -200,6 +201,16 @@ async def ejecutar_herramienta(name: str, arguments: dict):
 # ─── App FastAPI + SSE Transport ──────────────────────────────────────────────
 
 app = FastAPI(title="SIMIT MCP - Movilegal")
+
+# CORS para que GPTmaker pueda conectarse sin problemas de origen
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 sse = SseServerTransport("/messages")
 
 
@@ -223,7 +234,20 @@ async def endpoint_sse(request: Request):
 
 @app.post("/messages")
 async def endpoint_mensajes(request: Request):
-    """Recibe mensajes de GPTmaker."""
+    """Recibe mensajes de GPTmaker vía /messages."""
+    await sse.handle_post_message(
+        request.scope,
+        request.receive,
+        request._send
+    )
+
+
+@app.post("/sse")
+async def endpoint_sse_post(request: Request):
+    """
+    GPTmaker valida el servidor haciendo POST /sse.
+    Lo redirigimos al handler de mensajes para que funcione correctamente.
+    """
     await sse.handle_post_message(
         request.scope,
         request.receive,
