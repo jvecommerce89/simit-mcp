@@ -1,194 +1,6 @@
 """
 Servidor MCP - Consulta SIMIT Colombia
-Para Luisa de Movilegal en GPTmaker â v4.8
-
-Algoritmo de captcha reverse-engineered de captcha-worker.js:
-1. time = int(time.time())  [client-side]
-2. POST api.php endpoint=question â retorna {datos: {pregunta, dificultad_recomendada}}
-3. Para i in range(difficulty):
-   - Busca nonce (primo) tal que SHA256(JSON({question,time,nonce})).startswith("0000")
-   - verification.append([question, time, nonce])  # ARRAY, no dict
-4. EnvÃ­a verification como reCaptchaDTO.response (array de arrays) a SIMIT
-
-Fixes v4.4:
-- API devuelve "datos"/"pregunta"/"dificultad_recomendada" (espaÃ±ol), no "data"/"question"
-- reCaptchaDTO.response se envÃ­a como array real (no string JSON)
-- consumidor como integer 1 (no string "1")
-
-Fix v4.5:
-- verify_array era dict {"question":..,"time":..,"nonce":..} â debe ser [question, time, nonce]
-  (JS hace: verification.push([question, time, nonce]) â array de arrays)
-
-Fix v4.7:
-- Usar curl_cffi con impersonate="chrome124" para el POST a SIMIT.
-
-Fix v4.8:
-- UNA sola CurlSession(impersonate="chrome124") para TODAS las requests a fcm.org.co.
-  Esto asegura que las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint
-  de Chrome en TODOS los pasos: prefetch + captcha + SIMIT POST.
-  Las cookies fluyen automÃ¡ticamente entre subdominios de fcm.org.co (como en un browser real).
-  En v4.7 el captcha usaba httpx (TLS Python) â cookies Akamai con bot-score alto.
-"""
-
-import os
-import time as time_module
-import hashlib
-import json
-import httpx
-from curl_cffi.requests import AsyncSession as CurlSession
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from mcp.server import Server
-from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
-
-# âââ ConfiguraciÃ³n ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-
-SIMIT_URL = "https://consultasimit.fcm.org.co/simit/microservices/estado-cuenta-simit/estadocuenta/consulta"
-CAPTCHA_URL = "https://qxcaptcha.fcm.org.co/api.php"
-
-SIMIT_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "*/*",
-    "Origin": "https://www.fcm.org.co",
-    "Referer": "https://www.fcm.org.co/simit/",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept-Language": "es-CO,es;q=0.9",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-site",
-}
-
-CAPTCHA_HEADERS = {
-    "Origin": "https://www.fcm.org.co",
-    "Referer": "https://www.fcm.org.co/simit/",
-    "User-Agent": SIMIT_HEADERS["User-Agent"],
-    "Accept": "*/*",
-    "Accept-Language": "es-CO,es;q=0.9",
-}
-
-PREFETCH_HEADERS = {
-    "User-Agent": SIMIT_HEADERS["User-Agent"],
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "sec-ch-ua": SIMIT_HEADERS["sec-ch-ua"],
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
-
-
-# âââ Captcha (algoritmo real de captcha-worker.js) ââââââââââââââââââââââââââââ
-
-def es_primo(n: int) -> bool:
-    """
-    Mismo resultado que isPrime() del captcha-worker.js pero O(sqrt(n)) en vez de O(n).
-    """
-    if n <= 1:
-        return False
-    if n == 2:
-        return True
-    if n % 2 == 0:
-        return False
-    i = 3
-    while i * i <= n:
-        if n % i == 0:
-            return False
-        i += 2
-    return True
-
-
-def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -> dict:
-    """
-    ImplementaciÃ³n exacta de solveCaptcha() del captcha-worker.js:
-    sha256(JSON({question, time, nonce})).startsWith("0000") && isPrime(nonce)
-
-    OptimizaciÃ³n: pre-formatear el prefijo constante una sola vez (~4x mÃ¡s rÃ¡pido).
-    """
-    prefijo = f'{{"question":"{question}","time":{captcha_time},"nonce":'.encode()
-    sufijo = b'}'
-
-    nonce = nonce_inicial + 1  # worker empieza en 1 y hace nonce++ inmediatamente
-    while True:
-        data = prefijo + str(nonce).encode() + sufijo
-        hash_actual = hashlib.sha256(data).hexdigest()
-
-        if hash_actual[:4] == "0000" and es_primo(nonce):
-            return {
-                # FIX v4.5: JS hace verification.push([question, time, nonce]) â array, no dict
-                "verify_array": [question, captcha_time, nonce],
-                "nonce": nonce,
-                "hash": hash_actual,
-            }
-        nonce += 1
-
-
-def construir_captcha_response(question: str, captcha_time: int, difficulty: int) -> list:
-    """
-    Loop del captcha-worker.js: resuelve difficulty veces, acumulando el array.
-    Retorna lista de listas (no string) para enviar directamente como JSON array.
-    """
-    verification = []
-    nonce = 1
-    for _ in range(difficulty):
-        resultado = resolver_captcha(question, captcha_time, nonce)
-        nonce = resultado["nonce"]
-        verification.append(resultado["verify_array"])
-    return verification
-
-
-# âââ LÃ³gica de consulta SIMIT âââââââââââââââââââââââââââââââââââââââââââââââââ
-
-async def consultar_simit(documento: str) -> dict:
-    documento = documento.strip().upper()
-    captcha_time = int(time_module.time())
-
-    # Fix v4.8: UNA sola CurlSession con impersonate="chrome124" para TODAS las requests.
-    # Las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint de Chrome
-    # y fluyen automÃ¡ticamente entre subdominios de fcm.org.co via el cookie jar de libcurl.
-    async with CurlSession(impersonate="chrome124") as curl:
-
-        # Paso 0: visitar www.fcm.org.co/simit/ para que Akamai establezca cookies
-        # con Chrome TLS fingerprint (igual que cuando un usuario abre la pÃ¡gina)
-        prefetch_cookies = {}
-        try:
-            r0 = await curl.get(
-                "https://www.fcm.org.co/simit/",
-                headers=PREFETCH_HEADERS,
-                timeout=15,
-                allow_redirects=True,
-            )
-            prefetch_cookies = dict(r0.cookies)
-        except Exception:
-            pass
-
-        # Paso 1: obtener question del servidor captcha (con Chrome TLS, misma sesiÃ³n)
-        question = None
-        difficulty = 2
-        captcha_cookies = {}
-        try:
-            r1 = await curl.post(
-                CAPTCHA_URL,
-                data={"endpoint": "question"},
-                headers=CAPTCHA_HEADERS,
-                timeout=10,
-            )
-            captcha_cookies = dict(r1.cookies)
-            if r1.status_code == 200:
-                data = r1.json()
-                # La API usa "datos" (espaÃ±ol) â soportar tambiÃ©n "data" por si cambia
-                datos = data.get("datos") or data.get("data")
-Servidor MCP - Consulta SIMIT Colombia
-Para Luisa de Movilegal en GPTmaker — v4.8
+Para Luisa de Movilegal en GPTmaker - v4.8
 
 Algoritmo de captcha reverse-engineered de captcha-worker.js:
 1. time = int(time.time())  [client-side]
@@ -204,8 +16,8 @@ Fixes v4.4:
 - consumidor como integer 1 (no string "1")
 
 Fix v4.5:
-- verify_array era dict {"question":..,"time":..,"nonce":..} — debe ser [question, time, nonce]
-  (JS hace: verification.push([question, time, nonce]) — array de arrays)
+- verify_array era dict {"question":..,"time":..,"nonce":..} - debe ser [question, time, nonce]
+  (JS hace: verification.push([question, time, nonce]) - array de arrays)
 
 Fix v4.7:
 - Usar curl_cffi con impersonate="chrome124" para el POST a SIMIT.
@@ -312,7 +124,7 @@ def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -
 
         if hash_actual[:4] == "0000" and es_primo(nonce):
             return {
-                # FIX v4.5: JS hace verification.push([question, time, nonce]) — array, no dict
+                # FIX v4.5: JS hace verification.push([question, time, nonce]) - array, no dict
                 "verify_array": [question, captcha_time, nonce],
                 "nonce": nonce,
                 "hash": hash_actual,
@@ -373,7 +185,7 @@ async def consultar_simit(documento: str) -> dict:
             captcha_cookies = dict(r1.cookies)
             if r1.status_code == 200:
                 data = r1.json()
-                # La API usa "datos" (español) — soportar también "data" por si cambia
+                # La API usa "datos" (español) - soportar también "data" por si cambia
                 datos = data.get("datos") or data.get("data")
                 if not data.get("error") and isinstance(datos, dict):
                     question = datos.get("pregunta") or datos.get("question")
@@ -414,7 +226,7 @@ async def consultar_simit(documento: str) -> dict:
         body = {
             "filtro": documento,
             "reCaptchaDTO": {
-                "response": pow_array,   # array real, igual que el browser
+                "response": pow_array,  # array real, igual que el browser
                 "consumidor": 1,         # integer, igual que $CONSTANTES.TipoDevice.DESKTOP
             },
         }
@@ -442,7 +254,7 @@ async def consultar_simit(documento: str) -> dict:
             else:
                 return {
                     "exito": False,
-                    "error": f"SIMIT respondió {response.status_code}",
+                    "error": f"SIMIT respondio {response.status_code}",
                     "documento": documento,
                     "debug": {
                         **debug_info,
@@ -477,7 +289,7 @@ def formatear_respuesta(resultado: dict) -> str:
         elif status == 503:
             return (
                 f"No pude consultar SIMIT para {documento}. "
-                f"Servidor SIMIT caído (error 503). Consulta directamente en fcm.org.co/simit"
+                f"Servidor SIMIT caido (error 503). Consulta directamente en fcm.org.co/simit"
             )
         else:
             return (
@@ -531,7 +343,7 @@ def formatear_respuesta(resultado: dict) -> str:
             if placa or estado:
                 lineas.append(f"  - Placa {placa} | {secretaria} | {estado} | ${int(valor):,}")
 
-    lineas.append("Movilegal puede agestionar estos comparendos.")
+    lineas.append("Movilegal puede ayudarte a gestionar estos comparendos.")
     return "\n".join(lineas)
 
 
@@ -570,7 +382,7 @@ async def ejecutar_herramienta(name: str, arguments: dict):
 
     documento = arguments.get("documento", "").strip()
     if not documento:
-        return [TextContent(type="text", text="Necesito el nâ}mero de cédula o placa.")]
+        return [TextContent(type="text", text="Necesito el número de cédula o placa.")]
 
     resultado = await consultar_simit(documento)
     texto = formatear_respuesta(resultado)
@@ -717,7 +529,7 @@ async def raiz():
     return {
         "nombre": "SIMIT MCP Server - Movilegal",
         "version": "4.8",
-        "algoritmo": "SHA256 + isPrime PoW — curl_cffi chrome124 para TODAS las requests",
+        "algoritmo": "SHA256 + isPrime PoW - curl_cffi chrome124 para TODAS las requests",
         "herramientas": ["consultar_simit"],
         "conectar_en": "/sse",
         "debug": "/debug/{cedula}",
