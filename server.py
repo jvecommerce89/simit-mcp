@@ -2,16 +2,17 @@
 Servidor MCP - Consulta SIMIT Colombia
 Para Luisa de Movilegal en GPTmaker
 
-Flujo real (reverse-engineered de captcha.js):
-1. time = int(time.time())  [calculado client-side, NO viene del servidor]
-2. POST api.php endpoint=question → retorna data.data.question (hash hex del servidor)
-3. Web worker hace proof-of-work: busca nonce tal que MD5(question+nonce) empiece con X ceros
-4. Envía [{"question": q, "time": t, "nonce": n}] a SIMIT como reCaptchaDTO.response
+Algoritmo de captcha reverse-engineered de captcha-worker.js:
+1. time = int(time.time())  [client-side]
+2. POST api.php endpoint=question → retorna {question, recommended_difficulty}
+3. Para i in range(difficulty):
+   - Busca nonce (primo) tal que SHA256(JSON({question,time,nonce})).startswith("0000")
+   - verification.append({question, time, nonce})
+4. Envía verification como reCaptchaDTO.response a SIMIT
 """
 
 import os
 import time as time_module
-import random
 import hashlib
 import json
 import httpx
@@ -50,15 +51,63 @@ CAPTCHA_HEADERS = {
 }
 
 
-# ─── Captcha ──────────────────────────────────────────────────────────────────
+# ─── Captcha (algoritmo real de captcha-worker.js) ────────────────────────────
 
-async def obtener_question(client: httpx.AsyncClient) -> str | None:
+def es_primo(n: int) -> bool:
     """
-    Llama api.php con endpoint=question (igual que captcha.js).
-    Retorna el hash hex que el servidor quiere que el cliente resuelva.
+    Mismo resultado que isPrime() del captcha-worker.js pero O(sqrt(n)) en vez de O(n).
+    El JS usa for(i=2; i<n; i++) — da los mismos primos, solo es más lento.
+    """
+    if n <= 1:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+def sha256_hex(texto: str) -> str:
+    """SHA256 estándar — igual que sha256.js importado por captcha-worker.js"""
+    return hashlib.sha256(texto.encode()).hexdigest()
+
+
+def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -> dict:
+    """
+    Implementación exacta de solveCaptcha() del captcha-worker.js:
+
+    while sha256(JSON({question, time, nonce})).substr(0,4) != "0000" OR !isPrime(nonce):
+        nonce++
+
+    El JSON usa el mismo orden de claves que JavaScript: question, time, nonce
+    """
+    nonce = nonce_inicial + 1  # worker empieza en 1 y hace nonce++ inmediatamente
+    while True:
+        # JSON.stringify de JS produce exactamente este formato
+        verify_obj = {"question": question, "time": captcha_time, "nonce": nonce}
+        verify_json = json.dumps(verify_obj, separators=(',', ':'))
+        hash_actual = sha256_hex(verify_json)
+
+        if hash_actual[:4] == "0000" and es_primo(nonce):
+            return {
+                "verify_array": verify_obj,
+                "nonce": nonce,
+                "hash": hash_actual
+            }
+        nonce += 1
+
+
+async def obtener_question(client: httpx.AsyncClient) -> dict:
+    """
+    Llama api.php con endpoint=question (FormData, igual que captcha.js).
+    Retorna {question, recommended_difficulty} o None si falla.
     """
     try:
-        # captcha.js usa FormData (multipart), NO application/x-www-form-urlencoded
         r = await client.post(
             CAPTCHA_URL,
             data={"endpoint": "question"},
@@ -67,77 +116,70 @@ async def obtener_question(client: httpx.AsyncClient) -> str | None:
         )
         if r.status_code == 200:
             data = r.json()
-            # Retorna data.data.question según captcha.js
-            if isinstance(data.get("data"), dict):
-                return data["data"].get("question")
-            # Algunos servidores retornan data directamente
-            if isinstance(data.get("data"), str):
-                return data["data"]
+            if not data.get("error") and isinstance(data.get("data"), dict):
+                return data["data"]  # {question, recommended_difficulty}
     except Exception:
         pass
-    return None
+    return {}
 
 
-def proof_of_work(question: str, captcha_time: int, difficulty: int = 5) -> int:
+def construir_captcha_response(question: str, captcha_time: int, difficulty: int) -> str:
     """
-    Proof-of-work: busca nonce tal que MD5(question + str(nonce))
-    empiece con 'difficulty' ceros hexadecimales.
+    Implementación exacta del loop del captcha-worker.js:
 
-    Basado en el patrón típico de estos sistemas de captcha.
-    El captcha-worker.js hace este cómputo en un web worker del browser.
+    var verification = []
+    for(var i=0; i < times; i++) {
+        var response = solveCaptcha(data, nonce);
+        nonce = response.nonce;
+        verification.push(response.verify_array);
+    }
     """
-    nonce = 0
-    prefix = "0" * difficulty
-    while nonce < 10_000_000:
-        candidate = hashlib.md5(f"{question}{nonce}".encode()).hexdigest()
-        if candidate.startswith(prefix):
-            return nonce
-        nonce += 1
-    # Si no encuentra, retorna un nonce aleatorio (fallback)
-    return random.randint(1000000, 9999999)
-
-
-def construir_captcha_response(question: str, captcha_time: int, difficulty: int = 5) -> str:
-    """
-    Construye reCaptchaDTO.response igual que el browser.
-    Formato: [{"question": <q_del_servidor>, "time": <ts_cliente>, "nonce": <pow_result>}]
-    """
-    nonce = proof_of_work(question, captcha_time, difficulty)
-    captcha_obj = [{"question": question, "time": captcha_time, "nonce": nonce}]
-    return json.dumps(captcha_obj, separators=(',', ':'))
+    verification = []
+    nonce = 1  # nonce inicial del worker
+    for _ in range(difficulty):
+        resultado = resolver_captcha(question, captcha_time, nonce)
+        nonce = resultado["nonce"]  # el próximo ciclo empieza desde este nonce
+        verification.append(resultado["verify_array"])
+    return json.dumps(verification, separators=(',', ':'))
 
 
 # ─── Lógica de consulta SIMIT ─────────────────────────────────────────────────
 
 async def consultar_simit(documento: str) -> dict:
-    """
-    Consulta SIMIT con cédula o placa.
-    Flujo correcto según reverse-engineering de captcha.js:
-    1. time = int(time.time())  [client-side]
-    2. POST endpoint=question → obtener question del servidor
-    3. proof-of-work(question, time) → nonce
-    4. POST SIMIT con [{question, time, nonce}]
-    """
     documento = documento.strip().upper()
-    captcha_time = int(time_module.time())  # igual que Math.floor(Date.now()/1000)
+    captcha_time = int(time_module.time())  # Math.floor(Date.now()/1000)
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        # Paso 1: obtener question del servidor qxcaptcha
-        question = await obtener_question(client)
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        # Paso 1: obtener question del servidor
+        captcha_data = await obtener_question(client)
+        question = captcha_data.get("question")
+        difficulty = captcha_data.get("recommended_difficulty", 2)
 
         debug_info = {
             "captcha_time": captcha_time,
-            "question_obtenida": question,
+            "question": question,
+            "difficulty": difficulty,
         }
 
         if not question:
-            # Fallback: usar un hash aleatorio (no funcionará pero da info de debug)
-            question = hashlib.md5(str(captcha_time).encode()).hexdigest()
-            debug_info["question_fallback"] = True
+            return {
+                "exito": False,
+                "error": "No se pudo obtener question del captcha",
+                "documento": documento,
+                "debug": debug_info
+            }
 
-        # Paso 2: proof-of-work para calcular nonce
-        captcha_response = construir_captcha_response(question, captcha_time)
-        debug_info["captcha_response_preview"] = captcha_response[:100]
+        # Paso 2: proof-of-work con SHA256
+        try:
+            captcha_response = construir_captcha_response(question, captcha_time, difficulty)
+            debug_info["captcha_response"] = captcha_response[:200]
+        except Exception as e:
+            return {
+                "exito": False,
+                "error": f"Error en proof-of-work: {str(e)[:100]}",
+                "documento": documento,
+                "debug": debug_info
+            }
 
         body = {
             "filtro": documento,
@@ -202,29 +244,28 @@ def formatear_respuesta(resultado: dict) -> str:
         debug = resultado.get("debug", {})
         status = debug.get("status", "?")
 
-        if status == 503:
+        if status == 401:
             return (
                 f"No pude consultar SIMIT para {documento}. "
-                f"El servidor SIMIT está bloqueando la consulta (error 503). "
-                f"Sugiero al cliente consultar directamente en fcm.org.co/simit"
+                f"Error de autenticación (captcha rechazado, error 401). "
+                f"Por favor intenta de nuevo."
             )
-        elif status == 401:
+        elif status == 503:
             return (
                 f"No pude consultar SIMIT para {documento}. "
-                f"Error de autenticación (captcha inválido, error 401). "
-                f"Por favor intenta de nuevo en unos minutos."
+                f"Servidor SIMIT caído (error 503). "
+                f"Consulta directamente en fcm.org.co/simit"
             )
         else:
             return (
-                f"No pude consultar SIMIT para el documento {documento}. "
-                f"El sistema puede estar caído. Intenta de nuevo en unos minutos. "
-                f"(Error: {error})"
+                f"No pude consultar SIMIT para {documento}. "
+                f"Intenta de nuevo en unos minutos. (Error: {error})"
             )
 
     datos = resultado.get("datos", {})
 
     if not datos:
-        return f"Cédula {documento}: sin comparendos ni multas registradas en SIMIT. Estado limpio."
+        return f"Cédula {documento}: sin comparendos ni multas en SIMIT. Estado limpio."
 
     total_comparendos = (
         datos.get("comparendos") or
@@ -283,18 +324,14 @@ async def listar_herramientas():
             name="consultar_simit",
             description=(
                 "Consulta comparendos, multas e infracciones de tránsito en SIMIT Colombia. "
-                "Úsala cuando el cliente proporcione su número de cédula de ciudadanía o la placa "
-                "de su vehículo para verificar si tiene multas o comparendos pendientes de pago."
+                "Úsala cuando el cliente proporcione su cédula de ciudadanía o placa del vehículo."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "documento": {
                         "type": "string",
-                        "description": (
-                            "Número de cédula de ciudadanía o placa del vehículo. "
-                            "Ejemplos: '1049615965' o 'KWX584'"
-                        )
+                        "description": "Número de cédula o placa. Ejemplos: '1049615965' o 'KWX584'"
                     }
                 },
                 "required": ["documento"]
@@ -306,11 +343,11 @@ async def listar_herramientas():
 @mcp.call_tool()
 async def ejecutar_herramienta(name: str, arguments: dict):
     if name != "consultar_simit":
-        return [TextContent(type="text", text=f"Herramienta '{name}' no existe en este servidor.")]
+        return [TextContent(type="text", text=f"Herramienta '{name}' no existe.")]
 
     documento = arguments.get("documento", "").strip()
     if not documento:
-        return [TextContent(type="text", text="Necesito el número de cédula o placa para hacer la consulta.")]
+        return [TextContent(type="text", text="Necesito el número de cédula o placa.")]
 
     resultado = await consultar_simit(documento)
     texto = formatear_respuesta(resultado)
@@ -366,7 +403,7 @@ async def endpoint_sse_post(request: Request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "simit-movilegal", "version": "3.0"}
+                "serverInfo": {"name": "simit-movilegal", "version": "4.0"}
             }
         })
 
@@ -376,16 +413,11 @@ async def endpoint_sse_post(request: Request):
             "result": {
                 "tools": [{
                     "name": "consultar_simit",
-                    "description": (
-                        "Consulta comparendos, multas e infracciones de tránsito en SIMIT Colombia."
-                    ),
+                    "description": "Consulta comparendos y multas en SIMIT Colombia.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "documento": {
-                                "type": "string",
-                                "description": "Número de cédula de ciudadanía o placa del vehículo."
-                            }
+                            "documento": {"type": "string", "description": "Cédula o placa."}
                         },
                         "required": ["documento"]
                     }
@@ -408,7 +440,7 @@ async def endpoint_sse_post(request: Request):
         if not documento:
             return JSONResponse({
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"content": [{"type": "text", "text": "Necesito el número de cédula o placa."}]}
+                "result": {"content": [{"type": "text", "text": "Necesito cédula o placa."}]}
             })
 
         resultado = await consultar_simit(documento)
@@ -425,103 +457,25 @@ async def endpoint_sse_post(request: Request):
 
 @app.get("/debug/{documento}")
 async def debug_simit(documento: str):
-    """Retorna el resultado crudo de SIMIT con debug info del captcha."""
+    """Debug endpoint — resultado crudo con info del captcha."""
     resultado = await consultar_simit(documento)
     return JSONResponse(resultado)
 
 
-@app.get("/debug-captcha")
-async def debug_captcha():
-    """Prueba endpoint=question y otros endpoints de qxcaptcha."""
-    resultados = {}
-    async with httpx.AsyncClient(timeout=10) as client:
-        # El endpoint real según captcha.js es "question"
-        tests = [
-            ("question-multipart", {"endpoint": "question"}, True),
-            ("question-urlencoded", {"endpoint": "question"}, False),
-            ("verify-multipart", {"endpoint": "verify"}, True),
-            ("verify-urlencoded", {"endpoint": "verify"}, False),
-        ]
-        for desc, params, multipart in tests:
-            try:
-                if multipart:
-                    r = await client.post(CAPTCHA_URL, data=params, headers=CAPTCHA_HEADERS, timeout=8)
-                else:
-                    body = "&".join(f"{k}={v}" for k, v in params.items())
-                    r = await client.post(
-                        CAPTCHA_URL, content=body,
-                        headers={**CAPTCHA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=8
-                    )
-                resultados[desc] = {"status": r.status_code, "body": r.text[:300]}
-            except Exception as e:
-                resultados[desc] = {"error": str(e)[:100]}
-    return JSONResponse(resultados)
-
-
-@app.get("/debug-captchajs")
-async def debug_captcha_js():
-    """
-    Descarga captcha.js y captcha-worker.js desde qxcaptcha.
-    También prueba endpoint=question (el endpoint real del captcha).
-    """
-    results = {}
-    urls = [
-        "https://qxcaptcha.fcm.org.co/captcha.js",
-        "https://qxcaptcha.fcm.org.co/captcha-worker.js",
-        "https://qxcaptcha.fcm.org.co/",
-    ]
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        for url in urls:
-            try:
-                r = await client.get(url, headers=CAPTCHA_HEADERS, timeout=10)
-                results[url] = {
-                    "status": r.status_code,
-                    "content_type": r.headers.get("content-type", ""),
-                    "body": r.text[:10000]
-                }
-            except Exception as e:
-                results[url] = {"error": str(e)[:200]}
-
-        # Probar endpoint=question con FormData (igual que el browser)
-        tests = [
-            ("question-multipart", {"endpoint": "question"}, True),
-            ("question-urlencoded", {"endpoint": "question"}, False),
-            ("question-multipart-consumidor", {"endpoint": "question", "consumidor": "1"}, True),
-        ]
-        for desc, params, multipart in tests:
-            try:
-                if multipart:
-                    r = await client.post(CAPTCHA_URL, data=params, headers=CAPTCHA_HEADERS, timeout=8)
-                else:
-                    form_body = "&".join(f"{k}={v}" for k, v in params.items())
-                    r = await client.post(
-                        CAPTCHA_URL, content=form_body,
-                        headers={**CAPTCHA_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-                        timeout=8
-                    )
-                results[desc] = {"status": r.status_code, "body": r.text[:500]}
-            except Exception as e:
-                results[desc] = {"error": str(e)[:100]}
-
-    return JSONResponse(results)
-
-
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v3.0"}
+    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.0"}
 
 
 @app.get("/")
 async def raiz():
     return {
         "nombre": "SIMIT MCP Server - Movilegal",
-        "version": "3.0",
+        "version": "4.0",
+        "algoritmo": "SHA256 + isPrime proof-of-work (captcha-worker.js)",
         "herramientas": ["consultar_simit"],
         "conectar_en": "/sse",
         "debug": "/debug/{cedula}",
-        "debug_captcha": "/debug-captcha",
-        "debug_captchajs": "/debug-captchajs"
     }
 
 
