@@ -198,11 +198,21 @@ async def consultar_simit(documento: str) -> dict:
             }
         }
 
+        # Pasar cookies del captcha al request SIMIT (ADC load balancer cookies)
+        # qxcaptcha.fcm.org.co y consultasimit.fcm.org.co son subdominios distintos,
+        # httpx no las envía automáticamente → las pasamos manualmente en Cookie header
+        captcha_cookies = captcha_data.get("_cookies", {})
+        cookie_str = "; ".join(f"{k}={v}" for k, v in captcha_cookies.items())
+        simit_headers_req = {**SIMIT_HEADERS}
+        if cookie_str:
+            simit_headers_req["Cookie"] = cookie_str
+        debug_info["cookie_enviada_a_simit"] = cookie_str[:80] if cookie_str else "ninguna"
+
         try:
             response = await client.post(
                 SIMIT_URL,
                 json=body,
-                headers=SIMIT_HEADERS,
+                headers=simit_headers_req,
                 timeout=20
             )
 
@@ -522,3 +532,4 @@ async def raiz():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+    
