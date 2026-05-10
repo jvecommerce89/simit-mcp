@@ -1,6 +1,6 @@
 """
 Servidor MCP - Consulta SIMIT Colombia
-Para Luisa de Movilegal en GPTmaker â v4.7
+Para Luisa de Movilegal en GPTmaker â v4.8
 
 Algoritmo de captcha reverse-engineered de captcha-worker.js:
 1. time = int(time.time())  [client-side]
@@ -21,9 +21,13 @@ Fix v4.5:
 
 Fix v4.7:
 - Usar curl_cffi con impersonate="chrome124" para el POST a SIMIT.
-  Simula el TLS fingerprint (JA3/AKAMAI) exacto de Chrome â los anti-bots detectan
-  httpx/Python por el handshake TLS aunque los headers sean correctos.
-  El captcha sigue usando httpx (qxcaptcha.fcm.org.co no filtra por TLS).
+
+Fix v4.8:
+- UNA sola CurlSession(impersonate="chrome124") para TODAS las requests a fcm.org.co.
+  Esto asegura que las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint
+  de Chrome en TODOS los pasos: prefetch + captcha + SIMIT POST.
+  Las cookies fluyen automÃ¡ticamente entre subdominios de fcm.org.co (como en un browser real).
+  En v4.7 el captcha usaba httpx (TLS Python) â cookies Akamai con bot-score alto.
 """
 
 import os
@@ -64,6 +68,22 @@ CAPTCHA_HEADERS = {
     "Origin": "https://www.fcm.org.co",
     "Referer": "https://www.fcm.org.co/simit/",
     "User-Agent": SIMIT_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "es-CO,es;q=0.9",
+}
+
+PREFETCH_HEADERS = {
+    "User-Agent": SIMIT_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": SIMIT_HEADERS["sec-ch-ua"],
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 
@@ -112,42 +132,10 @@ def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -
         nonce += 1
 
 
-async def obtener_question(client: httpx.AsyncClient) -> dict:
-    """
-    Llama api.php con endpoint=question (FormData, igual que captcha.js).
-    La API devuelve: {"error":false,"datos":{"pregunta":"...","dificultad_recomendada":N}}
-    Mapea a {question, recommended_difficulty} para uso interno.
-    """
-    try:
-        r = await client.post(
-            CAPTCHA_URL,
-            data={"endpoint": "question"},
-            headers=CAPTCHA_HEADERS,
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            # La API usa "datos" (espaÃ±ol) â soportar tambiÃ©n "data" por si cambia
-            datos = data.get("datos") or data.get("data")
-            if not data.get("error") and isinstance(datos, dict):
-                resultado = {
-                    # La API usa "pregunta" â mapeamos a "question" para el PoW
-                    "question": datos.get("pregunta") or datos.get("question"),
-                    # La API usa "dificultad_recomendada"
-                    "recommended_difficulty": datos.get("dificultad_recomendada") or datos.get("recommended_difficulty", 2),
-                }
-                resultado["_headers"] = dict(r.headers)
-                resultado["_cookies"] = dict(r.cookies)
-                return resultado
-    except Exception:
-        pass
-    return {}
-
-
 def construir_captcha_response(question: str, captcha_time: int, difficulty: int) -> list:
     """
     Loop del captcha-worker.js: resuelve difficulty veces, acumulando el array.
-    Retorna lista de dicts (no string) para enviar directamente como JSON array.
+    Retorna lista de listas (no string) para enviar directamente como JSON array.
     """
     verification = []
     nonce = 1
@@ -160,53 +148,245 @@ def construir_captcha_response(question: str, captcha_time: int, difficulty: int
 
 # âââ LÃ³gica de consulta SIMIT âââââââââââââââââââââââââââââââââââââââââââââââââ
 
-async def prefetch_session_cookies(client: httpx.AsyncClient) -> dict:
-    """
-    Fix v4.6: Visita fcm.org.co/simit/ antes de la consulta para obtener
-    cookies de sesiÃ³n reales (igual que un browser al cargar la pÃ¡gina).
-    SIMIT puede requerir estas cookies ademÃ¡s de las del captcha.
-    """
-    urls_a_visitar = [
-        "https://www.fcm.org.co/simit/",
-        "https://consultasimit.fcm.org.co/simit/microservices/estado-cuenta-simit/estadocuenta/consulta",
-    ]
-    session_cookies = {}
-    for url in urls_a_visitar[:1]:  # solo la principal por ahora
+async def consultar_simit(documento: str) -> dict:
+    documento = documento.strip().upper()
+    captcha_time = int(time_module.time())
+
+    # Fix v4.8: UNA sola CurlSession con impersonate="chrome124" para TODAS las requests.
+    # Las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint de Chrome
+    # y fluyen automÃ¡ticamente entre subdominios de fcm.org.co via el cookie jar de libcurl.
+    async with CurlSession(impersonate="chrome124") as curl:
+
+        # Paso 0: visitar www.fcm.org.co/simit/ para que Akamai establezca cookies
+        # con Chrome TLS fingerprint (igual que cuando un usuario abre la pÃ¡gina)
+        prefetch_cookies = {}
         try:
-            r = await client.get(
-                url,
-                headers={
-                    "User-Agent": SIMIT_HEADERS["User-Agent"],
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "es-CO,es;q=0.9",
-                },
-                timeout=10,
+            r0 = await curl.get(
+                "https://www.fcm.org.co/simit/",
+                headers=PREFETCH_HEADERS,
+                timeout=15,
+                allow_redirects=True,
             )
-            session_cookies.update(dict(r.cookies))
+            prefetch_cookies = dict(r0.cookies)
         except Exception:
             pass
-    return session_cookies
 
+        # Paso 1: obtener question del servidor captcha (con Chrome TLS, misma sesiÃ³n)
+        question = None
+        difficulty = 2
+        captcha_cookies = {}
+        try:
+            r1 = await curl.post(
+                CAPTCHA_URL,
+                data={"endpoint": "question"},
+                headers=CAPTCHA_HEADERS,
+                timeout=10,
+            )
+            captcha_cookies = dict(r1.cookies)
+            if r1.status_code == 200:
+                data = r1.json()
+                # La API usa "datos" (espaÃ±ol) â soportar tambiÃ©n "data" por si cambia
+                datos = data.get("datos") or data.get("data")
+Servidor MCP - Consulta SIMIT Colombia
+Para Luisa de Movilegal en GPTmaker — v4.8
+
+Algoritmo de captcha reverse-engineered de captcha-worker.js:
+1. time = int(time.time())  [client-side]
+2. POST api.php endpoint=question → retorna {datos: {pregunta, dificultad_recomendada}}
+3. Para i in range(difficulty):
+   - Busca nonce (primo) tal que SHA256(JSON({question,time,nonce})).startswith("0000")
+   - verification.append([question, time, nonce])  # ARRAY, no dict
+4. Envía verification como reCaptchaDTO.response (array de arrays) a SIMIT
+
+Fixes v4.4:
+- API devuelve "datos"/"pregunta"/"dificultad_recomendada" (español), no "data"/"question"
+- reCaptchaDTO.response se envía como array real (no string JSON)
+- consumidor como integer 1 (no string "1")
+
+Fix v4.5:
+- verify_array era dict {"question":..,"time":..,"nonce":..} — debe ser [question, time, nonce]
+  (JS hace: verification.push([question, time, nonce]) — array de arrays)
+
+Fix v4.7:
+- Usar curl_cffi con impersonate="chrome124" para el POST a SIMIT.
+
+Fix v4.8:
+- UNA sola CurlSession(impersonate="chrome124") para TODAS las requests a fcm.org.co.
+  Esto asegura que las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint
+  de Chrome en TODOS los pasos: prefetch + captcha + SIMIT POST.
+  Las cookies fluyen automáticamente entre subdominios de fcm.org.co (como en un browser real).
+  En v4.7 el captcha usaba httpx (TLS Python) → cookies Akamai con bot-score alto.
+"""
+
+import os
+import time as time_module
+import hashlib
+import json
+import httpx
+from curl_cffi.requests import AsyncSession as CurlSession
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
+
+# ─── Configuración ────────────────────────────────────────────────────────────
+
+SIMIT_URL = "https://consultasimit.fcm.org.co/simit/microservices/estado-cuenta-simit/estadocuenta/consulta"
+CAPTCHA_URL = "https://qxcaptcha.fcm.org.co/api.php"
+
+SIMIT_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "*/*",
+    "Origin": "https://www.fcm.org.co",
+    "Referer": "https://www.fcm.org.co/simit/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "es-CO,es;q=0.9",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+}
+
+CAPTCHA_HEADERS = {
+    "Origin": "https://www.fcm.org.co",
+    "Referer": "https://www.fcm.org.co/simit/",
+    "User-Agent": SIMIT_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "Accept-Language": "es-CO,es;q=0.9",
+}
+
+PREFETCH_HEADERS = {
+    "User-Agent": SIMIT_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": SIMIT_HEADERS["sec-ch-ua"],
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+
+# ─── Captcha (algoritmo real de captcha-worker.js) ────────────────────────────
+
+def es_primo(n: int) -> bool:
+    """
+    Mismo resultado que isPrime() del captcha-worker.js pero O(sqrt(n)) en vez de O(n).
+    """
+    if n <= 1:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -> dict:
+    """
+    Implementación exacta de solveCaptcha() del captcha-worker.js:
+    sha256(JSON({question, time, nonce})).startsWith("0000") && isPrime(nonce)
+
+    Optimización: pre-formatear el prefijo constante una sola vez (~4x más rápido).
+    """
+    prefijo = f'{{"question":"{question}","time":{captcha_time},"nonce":'.encode()
+    sufijo = b'}'
+
+    nonce = nonce_inicial + 1  # worker empieza en 1 y hace nonce++ inmediatamente
+    while True:
+        data = prefijo + str(nonce).encode() + sufijo
+        hash_actual = hashlib.sha256(data).hexdigest()
+
+        if hash_actual[:4] == "0000" and es_primo(nonce):
+            return {
+                # FIX v4.5: JS hace verification.push([question, time, nonce]) — array, no dict
+                "verify_array": [question, captcha_time, nonce],
+                "nonce": nonce,
+                "hash": hash_actual,
+            }
+        nonce += 1
+
+
+def construir_captcha_response(question: str, captcha_time: int, difficulty: int) -> list:
+    """
+    Loop del captcha-worker.js: resuelve difficulty veces, acumulando el array.
+    Retorna lista de listas (no string) para enviar directamente como JSON array.
+    """
+    verification = []
+    nonce = 1
+    for _ in range(difficulty):
+        resultado = resolver_captcha(question, captcha_time, nonce)
+        nonce = resultado["nonce"]
+        verification.append(resultado["verify_array"])
+    return verification
+
+
+# ─── Lógica de consulta SIMIT ─────────────────────────────────────────────────
 
 async def consultar_simit(documento: str) -> dict:
     documento = documento.strip().upper()
-    captcha_time = int(time_module.time())  # Math.floor(Date.now()/1000)
+    captcha_time = int(time_module.time())
 
-    async with httpx.AsyncClient(timeoout=60, follow_redirects=True) as client:
-        # Paso 0 (v4.6): pre-fetch cookies de sesiÃ³n del sitio principal
-        session_cookies = await prefetch_session_cookies(client)
+    # Fix v4.8: UNA sola CurlSession con impersonate="chrome124" para TODAS las requests.
+    # Las cookies Akamai (ADC_CONN, ADC_REQ) se generan con TLS fingerprint de Chrome
+    # y fluyen automáticamente entre subdominios de fcm.org.co via el cookie jar de libcurl.
+    async with CurlSession(impersonate="chrome124") as curl:
 
-        # Paso 1: obtener question del servidor captcha
-        captcha_data = await obtener_question(client)
-        question = captcha_data.get("question")
-        difficulty = captcha_data.get("recommended_difficulty", 2)
+        # Paso 0: visitar www.fcm.org.co/simit/ para que Akamai establezca cookies
+        # con Chrome TLS fingerprint (igual que cuando un usuario abre la página)
+        prefetch_cookies = {}
+        try:
+            r0 = await curl.get(
+                "https://www.fcm.org.co/simit/",
+                headers=PREFETCH_HEADERS,
+                timeout=15,
+                allow_redirects=True,
+            )
+            prefetch_cookies = dict(r0.cookies)
+        except Exception:
+            pass
+
+        # Paso 1: obtener question del servidor captcha (con Chrome TLS, misma sesión)
+        question = None
+        difficulty = 2
+        captcha_cookies = {}
+        try:
+            r1 = await curl.post(
+                CAPTCHA_URL,
+                data={"endpoint": "question"},
+                headers=CAPTCHA_HEADERS,
+                timeout=10,
+            )
+            captcha_cookies = dict(r1.cookies)
+            if r1.status_code == 200:
+                data = r1.json()
+                # La API usa "datos" (español) — soportar también "data" por si cambia
+                datos = data.get("datos") or data.get("data")
+                if not data.get("error") and isinstance(datos, dict):
+                    question = datos.get("pregunta") or datos.get("question")
+                    difficulty = int(datos.get("dificultad_recomendada") or datos.get("recommended_difficulty") or 2)
+        except Exception:
+            pass
 
         debug_info = {
             "captcha_time": captcha_time,
             "question": question,
             "difficulty": difficulty,
-            "captcha_cookies": captcha_data.get("_cookies", {}),
-            "session_cookies": session_cookies,
+            "prefetch_cookies": prefetch_cookies,
+            "captcha_cookies": captcha_cookies,
         }
 
         if not question:
@@ -229,9 +409,323 @@ async def consultar_simit(documento: str) -> dict:
                 "debug": debug_info,
             }
 
-        # Paso 3: construir body con array real (no string)
+        # Paso 3: POST a SIMIT con misma sesión curl_cffi
+        # Las cookies Akamai del prefetch y captcha fluyen automáticamente (libcurl cookie jar)
         body = {
             "filtro": documento,
             "reCaptchaDTO": {
-                "response": pow_array,  # array real, igual que el browser
-                "consumidor": 1,        # integer, igual que $CONSTANTBÕS\Ñ]XÙKTÒÕÔKÒ¢FöF5ö6öö¶W2Ò²¢§6W76öåö6öö¶W2Â¢¦6F6ö6öö¶W7Ò26F66ö'&VW67&&R66öæfÆ7Fð¢6öö¶U÷7G"Ò#²"æ¦öâb'¶·Ó×·gÒ"f÷"²ÂbâFöF5ö6öö¶W2æFV×2¢6ÖEöVFW'5÷&WÒ²¢¥4ÔEôTDU%7Ð¢b6öö¶U÷7G# ¢6ÖEöVFW'5÷&W²$6öö¶R%ÒÒ6öö¶U÷7G ¢FV'Vuöæfõ²&6öö¶UöVçfFö÷6ÖB%ÒÒ6öö¶U÷7G%³£#Òb6öö¶U÷7G"VÇ6R&ææwVæ  ¢G' ¢2fcBãs¢7W&Åö6ff6öâ×W'6öæFSÒ&6&öÖS#B"(	BDÅ2fævW'&çBL:çF6ð¢2Â'&÷w6W"&VÂâGGW6DÅ2W7L:æF"FöâVRÆ÷2çFÖ&÷G2FWFV7Fâà¢7æ2vF7W&Å6W76öâ×W'6öæFSÒ&6&öÖS#B"27W&Ã ¢&W7öç6RÒvB7W&Âç÷7B¢4ÔEõU$ÂÀ¢§6öãÖ&öGÀ¢VFW'3×6ÖEöVFW'5÷&WÀ¢FÖV÷WCÓ#À¢ ¢&u÷7FGW2Ò&W7öç6Rç7FGW5ö6öFP¢&u÷FWBÒ&W7öç6RçFWE³£Ð¢6ÖEöVFW'2ÒF7B&W7öç6RæVFW'2 ¢b&W7öç6Rç7FGW5ö6öFRÓÒ# ¢FFÒ&W7öç6Ræ§6öâ¢&WGW&â°¢&WFò#¢G'VRÀ¢&FF÷2#¢FFÀ¢&Fö7VÖVçFò#¢Fö7VÖVçFòÀ¢&FV'Vr#¢²¢¦FV'VuöæfòÂ'7FGW2#¢&u÷7FGW7ÒÀ¢Ð¢VÇ6S ¢&WGW&â°¢&WFò#¢fÇ6RÀ¢&W'&÷"#¢b%4ÔB&W7öæF;2·&W7öç6Rç7FGW5ö6öFWÒ"À¢&Fö7VÖVçFò#¢Fö7VÖVçFòÀ¢&FV'Vr#¢°¢¢¦FV'VuöæfòÀ¢'7FGW2#¢&u÷7FGW2À¢&&öG÷&WfWr#¢&u÷FWBÀ¢'6ÖE÷&W7öç6UöVFW'2#¢6ÖEöVFW'2À¢ÒÀ¢Ð ¢W6WBGGä6öææV7DW'&÷"2S ¢&WGW&â°¢&WFò#¢fÇ6RÀ¢&W'&÷"#¢b$æò6RVFò6öæV7F"4ÔC¢·7G"R³£×Ò"À¢&Fö7VÖVçFò#¢Fö7VÖVçFòÀ¢&FV'Vr#¢²¢¦FV'VuöæfòÂ'Fò#¢$6öææV7DW'&÷"'ÒÀ¢Ð¢W6WBW6WFöâ2S ¢&WGW&â°¢&WFò#¢fÇ6RÀ¢&W'&÷"#¢b$W'&÷"6öç7VÇFæFò4ÔC¢·7G"R³£×Ò"À¢&Fö7VÖVçFò#¢Fö7VÖVçFòÀ¢&FV'Vr#¢²¢¦FV'VuöæfòÂ'Fò#¢GRRåõöæÖUõ÷ÒÀ¢Ð  ¦FVbf÷&ÖFV%÷&W7VW7F&W7VÇFFó¢F7BÓâ7G# ¢Fö7VÖVçFòÒ&W7VÇFFòævWB&Fö7VÖVçFò"Â"" ¢bæ÷B&W7VÇFFòævWB&WFò" ¢W'&÷"Ò&W7VÇFFòævWB&W'&÷""Â""¢FV'VrÒ&W7VÇFFòævWB&FV'Vr"Â·Ò¢7FGW2ÒFV'VrævWB'7FGW2"Â#ò" ¢b7FGW2ÓÒC ¢&WGW&â¢b$æòVFR6öç7VÇF"4ÔB&¶Fö7VÖVçF÷Òâ ¢b$6F6&V6¦FòW'&÷"Câ÷"ff÷"çFVçFFRçVWfòâ ¢¢VÆb7FGW2ÓÒS3 ¢&WGW&â¢b$æòVFR6öç7VÇF"4ÔB&¶Fö7VÖVçF÷Òâ ¢b%6W'fF÷"4ÔB6:ÖFòW'&÷"S2â6öç7VÇFF&V7FÖVçFRVâf6Òæ÷&ræ6ò÷6ÖB ¢¢VÇ6S ¢&WGW&â¢b$æòVFR6öç7VÇF"4ÔB&¶Fö7VÖVçF÷Òâ ¢b$çFVçFFRçVWfòVâVæ÷2ÖçWF÷2âW'&÷#¢¶W'&÷'Ò ¢ ¢FF÷2Ò&W7VÇFFòævWB&FF÷2"Â·Ò ¢bæ÷BFF÷3 ¢&WGW&âb$<:GVÆ¶Fö7VÖVçF÷Ó¢6â6ö×&VæF÷2æ×VÇF2Vâ4ÔBâW7FFòÆ×òâ  ¢F÷FÅö6ö×&VæF÷2Ò¢FF÷2ævWB&6ö×&VæF÷2"÷ ¢FF÷2ævWB'F÷FÄ6ö×&VæF÷2"÷ ¢FF÷2ævWB&6çFFD6ö×&VæF÷2"÷ ¢ÆVâFF÷2ævWB&Æ7F6ö×&VæF÷2"ÂµÒ÷" ¢¢F÷FÅö×VÇF2Ò¢FF÷2ævWB&×VÇF2"÷ ¢FF÷2ævWB'F÷FÄ×VÇF2"÷ ¢FF÷2ævWB&6çFFD×VÇF2"÷ ¢ÆVâFF÷2ævWB&Æ7F×VÇF2"ÂµÒ÷" ¢¢fÆ÷%÷F÷FÂÒ¢FF÷2ævWB'F÷FÂ"÷ ¢FF÷2ævWB'fÆ÷%F÷FÂ"÷ ¢FF÷2ævWB'F÷FÄv""÷ ¢FF÷2ævWB'6ÆFõF÷FÂ"÷" ¢ ¢bfÆ÷%÷F÷FÂÓÒæBF÷FÅö6ö×&VæF÷2ÓÒæBF÷FÅö×VÇF2ÓÒ ¢&WGW&âb$<:GVÆ¶Fö7VÖVçF÷Ó¢6â6ö×&VæF÷2æ×VÇF2Vâ4ÔBâW7FFòÆ×òâ  ¢ÆæV2Ò¶b$6öç7VÇF4ÔBÒFö7VÖVçFò¶Fö7VÖVçF÷Ó¢%Ð¢bF÷FÅö6ö×&VæF÷3 ¢ÆæV2æVæBb$6ö×&VæF÷3¢·F÷FÅö6ö×&VæF÷7Ò"¢bF÷FÅö×VÇF3 ¢ÆæV2æVæBb$×VÇF3¢·F÷FÅö×VÇF7Ò"¢bfÆ÷%÷F÷FÃ ¢ÆæV2æVæBb%F÷FÂv#¢G¶çBfÆ÷%÷F÷FÂ¢ÇÒ" ¢Æ7FÒFF÷2ævWB&Æ7F6ö×&VæF÷2"ÂFF÷2ævWB&6ö×&VæF÷4Æ7B"ÂµÒ¢bÆ7F ¢ÆæV2æVæB$FWFÆÆS¢"¢f÷"FVÒâÆ7F³£UÓ ¢Æ6ÒFVÒævWB'Æ6"ÂFVÒævWB&æõÆ6"Â""¢W7FFòÒFVÒævWB&W7FFò"ÂFVÒævWB&W7FFô6ö×&VæFò"Â""¢fÆ÷"ÒFVÒævWB'fÆ÷$v""ÂFVÒævWB'fÆ÷""Â¢6V7&WF&ÒFVÒævWB'6V7&WF&"ÂFVÒævWB&÷&væ6ÖõG&ç6Fò"Â""¢bÆ6÷"W7FFó ¢ÆæV2æVæBb"ÒÆ6·Æ6ÒÂ·6V7&WF&ÒÂ¶W7FF÷ÒÂG¶çBfÆ÷"¢ÇÒ" ¢ÆæV2æVæB$Ö÷fÆVvÂVVFRVF'FRvW7Föæ"W7F÷26ö×&VæF÷2â"¢&WGW&â%Æâ"æ¦öâÆæV2  ¢2)H)H)H6W'fF÷"Ô5)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H  ¦Ö7Ò6W'fW"'6ÖBÖÖ÷fÆVvÂ"  ¤Ö7æÆ7E÷FööÇ2¦7æ2FVbÆ7F%öW'&ÖVçF2 ¢&WGW&â°¢FööÂ¢æÖSÒ&6öç7VÇF%÷6ÖB"À¢FW67&FöãÒ¢$6öç7VÇF6ö×&VæF÷2Â×VÇF2Ræg&66öæW2FRG,:ç6FòVâ4ÔB6öÆöÖ&â ¢,9§6Æ7VæFòVÂ6ÆVçFR&÷÷&6öæR7R<:GVÆFR6VFFì:ÖòÆ6FVÂfV:Ö7VÆòâ ¢À¢çWE66VÖ×°¢'GR#¢&ö&¦V7B"À¢'&÷W'FW2#¢°¢&Fö7VÖVçFò#¢°¢'GR#¢'7G&ær"À¢&FW67&Föâ#¢$ì;¦ÖW&òFR<:GVÆòÆ6âV¦V×Æ÷3¢sCcScRròtµuSBr"À¢Ð¢ÒÀ¢'&WV&VB#¢²&Fö7VÖVçFò%ÒÀ¢ÒÀ¢¢Ð  ¤Ö7æ6ÆÅ÷FööÂ¦7æ2FVbV¦V7WF%öW'&ÖVçFæÖS¢7G"Â&wVÖVçG3¢F7B ¢bæÖRÒ&6öç7VÇF%÷6ÖB# ¢&WGW&âµFWD6öçFVçBGSÒ'FWB"ÂFWCÖb$W'&ÖVçFw¶æÖWÒræòW7FRâ"Ð ¢Fö7VÖVçFòÒ&wVÖVçG2ævWB&Fö7VÖVçFò"Â""ç7G&¢bæ÷BFö7VÖVçFó ¢&WGW&âµFWD6öçFVçBGSÒ'FWB"ÂFWCÒ$æV6W6FòVÂì;¦ÖW&òFR<:GVÆòÆ6â"Ð ¢&W7VÇFFòÒvB6öç7VÇF%÷6ÖBFö7VÖVçFò¢FWFòÒf÷&ÖFV%÷&W7VW7F&W7VÇFFò¢&WGW&âµFWD6öçFVçBGSÒ'FWB"ÂFWC×FWFòÐ  ¢2)H)H)Hf7D)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H  ¦Òf7DFFÆSÒ%4ÔBÔ5ÒÖ÷fÆVvÂ" ¦æFEöÖFFÆWv&R¢4õ%4ÖFFÆWv&RÀ¢ÆÆ÷uö÷&vç3Õ²"¢%ÒÀ¢ÆÆ÷uö7&VFVçFÇ3ÕG'VRÀ¢ÆÆ÷uöÖWFöG3Õ²"¢%ÒÀ¢ÆÆ÷uöVFW'3Õ²"¢%ÒÀ¢ §76RÒ76U6W'fW%G&ç7÷'B"öÖW76vW2"  ¤ævWB"÷76R"¦7æ2FVbVæGöçE÷76R&WVW7C¢&WVW7B ¢7æ2vF76Ræ6öææV7E÷76R¢&WVW7Bç66÷RÀ¢&WVW7Bç&V6VfRÀ¢&WVW7Bå÷6VæBÀ¢2ÆVW"ÂW67&&" ¢vBÖ7ç'VâÆVW"ÂW67&&"ÂÖ7æ7&VFUöæFÆ¦Föåö÷Föç2  ¤ç÷7B"öÖW76vW2"¦7æ2FVbVæGöçEöÖVç6¦W2&WVW7C¢&WVW7B ¢vB76RææFÆU÷÷7EöÖW76vR&WVW7Bç66÷RÂ&WVW7Bç&V6VfRÂ&WVW7Bå÷6VæB  ¤ç÷7B"÷76R"¦7æ2FVbVæGöçE÷76U÷÷7B&WVW7C¢&WVW7B ¢G' ¢&öGÒvB&WVW7Bæ§6öâ¢W6WBW6WFöã ¢&WGW&â¥4ôå&W7öç6R¢²&§6öç'2#¢#"ã"Â&B#¢æöæRÂ&W'&÷"#¢²&6öFR#¢Ó3#sÂ&ÖW76vR#¢%'6RW'&÷"'×ÒÀ¢7FGW5ö6öFSÓ#À¢ ¢ÖWFöBÒ&öGævWB&ÖWFöB"Â""¢&WöBÒ&öGævWB&B"Â ¢bÖWFöBÓÒ&æFÆ¦R# ¢&WGW&â¥4ôå&W7öç6R°¢&§6öç'2#¢#"ã"Â&B#¢&WöBÀ¢'&W7VÇB#¢°¢'&÷Fö6öÅfW'6öâ#¢###BÓÓR"À¢&6&ÆFW2#¢²'FööÇ2#¢·×ÒÀ¢'6W'fW$æfò#¢²&æÖR#¢'6ÖBÖÖ÷fÆVvÂ"Â'fW'6öâ#¢#BãB'ÒÀ¢ÒÀ¢Ò ¢VÆbÖWFöBÓÒ'FööÇ2öÆ7B# ¢&WGW&â¥4ôå&W7öç6R°¢&§6öç'2#¢#"ã"Â&B#¢&WöBÀ¢'&W7VÇB#¢°¢'FööÇ2#¢·°¢&æÖR#¢&6öç7VÇF%÷6ÖB"À¢&FW67&Föâ#¢$6öç7VÇF6ö×&VæF÷2×VÇF2Vâ4ÔB6öÆöÖ&â"À¢&çWE66VÖ#¢°¢'GR#¢&ö&¦V7B"À¢'&÷W'FW2#¢°¢&Fö7VÖVçFò#¢²'GR#¢'7G&ær"Â&FW67&Föâ#¢$<:GVÆòÆ6â'ÒÀ¢ÒÀ¢'&WV&VB#¢²&Fö7VÖVçFò%ÒÀ¢ÒÀ¢ÕÒÀ¢ÒÀ¢Ò ¢VÆbÖWFöBÓÒ'FööÇ2ö6ÆÂ# ¢&×2Ò&öGævWB'&×2"Â·Ò¢FööÅöæÖRÒ&×2ævWB&æÖR"Â""¢&wVÖVçG2Ò&×2ævWB&&wVÖVçG2"Â·Ò ¢bFööÅöæÖRÒ&6öç7VÇF%÷6ÖB# ¢&WGW&â¥4ôå&W7öç6R°¢&§6öç'2#¢#"ã"Â&B#¢&WöBÀ¢&W'&÷"#¢²&6öFR#¢Ó3#c"Â&ÖW76vR#¢b$W'&ÖVçFw·FööÅöæÖWÒræòW7FRâ'ÒÀ¢Ò ¢Fö7VÖVçFòÒ&wVÖVçG2ævWB&Fö7VÖVçFò"Â""ç7G&¢bæ÷BFö7VÖVçFó ¢&WGW&â¥4ôå&W7öç6R°¢&§6öç'2#¢#"ã"Â&B#¢&WöBÀ¢'&W7VÇB#¢²&6öçFVçB#¢·²'GR#¢'FWB"Â'FWB#¢$æV6W6Fò<:GVÆòÆ6â'Õ×ÒÀ¢Ò ¢
+                "response": pow_array,   # array real, igual que el browser
+                "consumidor": 1,         # integer, igual que $CONSTANTES.TipoDevice.DESKTOP
+            },
+        }
+
+        try:
+            response = await curl.post(
+                SIMIT_URL,
+                json=body,
+                headers=SIMIT_HEADERS,
+                timeout=20,
+            )
+
+            raw_status = response.status_code
+            raw_text = response.text[:1000]
+            simit_headers = dict(response.headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "exito": True,
+                    "datos": data,
+                    "documento": documento,
+                    "debug": {**debug_info, "status": raw_status},
+                }
+            else:
+                return {
+                    "exito": False,
+                    "error": f"SIMIT respondió {response.status_code}",
+                    "documento": documento,
+                    "debug": {
+                        **debug_info,
+                        "status": raw_status,
+                        "body_preview": raw_text,
+                        "simit_response_headers": simit_headers,
+                    },
+                }
+
+        except Exception as e:
+            return {
+                "exito": False,
+                "error": f"Error consultando SIMIT: {str(e)[:200]}",
+                "documento": documento,
+                "debug": {**debug_info, "tipo": type(e).__name__},
+            }
+
+
+def formatear_respuesta(resultado: dict) -> str:
+    documento = resultado.get("documento", "")
+
+    if not resultado.get("exito"):
+        error = resultado.get("error", "")
+        debug = resultado.get("debug", {})
+        status = debug.get("status", "?")
+
+        if status == 401:
+            return (
+                f"No pude consultar SIMIT para {documento}. "
+                f"Captcha rechazado (error 401). Por favor intenta de nuevo."
+            )
+        elif status == 503:
+            return (
+                f"No pude consultar SIMIT para {documento}. "
+                f"Servidor SIMIT caído (error 503). Consulta directamente en fcm.org.co/simit"
+            )
+        else:
+            return (
+                f"No pude consultar SIMIT para {documento}. "
+                f"Intenta de nuevo en unos minutos. (Error: {error})"
+            )
+
+    datos = resultado.get("datos", {})
+
+    if not datos:
+        return f"Cédula {documento}: sin comparendos ni multas en SIMIT. Estado limpio."
+
+    total_comparendos = (
+        datos.get("comparendos") or
+        datos.get("totalComparendos") or
+        datos.get("cantidadComparendos") or
+        len(datos.get("listaComparendos", [])) or 0
+    )
+    total_multas = (
+        datos.get("multas") or
+        datos.get("totalMultas") or
+        datos.get("cantidadMultas") or
+        len(datos.get("listaMultas", [])) or 0
+    )
+    valor_total = (
+        datos.get("total") or
+        datos.get("valorTotal") or
+        datos.get("totalAPagar") or
+        datos.get("saldoTotal") or 0
+    )
+
+    if valor_total == 0 and total_comparendos == 0 and total_multas == 0:
+        return f"Cédula {documento}: sin comparendos ni multas en SIMIT. Estado limpio."
+
+    lineas = [f"Consulta SIMIT - Documento {documento}:"]
+    if total_comparendos:
+        lineas.append(f"Comparendos: {total_comparendos}")
+    if total_multas:
+        lineas.append(f"Multas: {total_multas}")
+    if valor_total:
+        lineas.append(f"Total a pagar: ${int(valor_total):,}")
+
+    lista = datos.get("listaComparendos", datos.get("comparendosList", []))
+    if lista:
+        lineas.append("Detalle:")
+        for item in lista[:5]:
+            placa = item.get("placa", item.get("noPlaca", ""))
+            estado = item.get("estado", item.get("estadoComparendo", ""))
+            valor = item.get("valorAPagar", item.get("valor", 0))
+            secretaria = item.get("secretaria", item.get("organismoTransito", ""))
+            if placa or estado:
+                lineas.append(f"  - Placa {placa} | {secretaria} | {estado} | ${int(valor):,}")
+
+    lineas.append("Movilegal puede agestionar estos comparendos.")
+    return "\n".join(lineas)
+
+
+# ─── Servidor MCP ─────────────────────────────────────────────────────────────
+
+mcp = Server("simit-movilegal")
+
+
+@mcp.list_tools()
+async def listar_herramientas():
+    return [
+        Tool(
+            name="consultar_simit",
+            description=(
+                "Consulta comparendos, multas e infracciones de tránsito en SIMIT Colombia. "
+                "Úsala cuando el cliente proporcione su cédula de ciudadanía o placa del vehículo."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "documento": {
+                        "type": "string",
+                        "description": "Número de cédula o placa. Ejemplos: '1049615965' o 'KWX584'",
+                    }
+                },
+                "required": ["documento"],
+            },
+        )
+    ]
+
+
+@mcp.call_tool()
+async def ejecutar_herramienta(name: str, arguments: dict):
+    if name != "consultar_simit":
+        return [TextContent(type="text", text=f"Herramienta '{name}' no existe.")]
+
+    documento = arguments.get("documento", "").strip()
+    if not documento:
+        return [TextContent(type="text", text="Necesito el nâ}mero de cédula o placa.")]
+
+    resultado = await consultar_simit(documento)
+    texto = formatear_respuesta(resultado)
+    return [TextContent(type="text", text=texto)]
+
+
+# ─── App FastAPI ──────────────────────────────────────────────────────────────
+
+app = FastAPI(title="SIMIT MCP - Movilegal")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+sse = SseServerTransport("/messages")
+
+
+@app.get("/sse")
+async def endpoint_sse(request: Request):
+    async with sse.connect_sse(
+        request.scope,
+        request.receive,
+        request._send,
+    ) as (leer, escribir):
+        await mcp.run(leer, escribir, mcp.create_initialization_options())
+
+
+@app.post("/messages")
+async def endpoint_mensajes(request: Request):
+    await sse.handle_post_message(request.scope, request.receive, request._send)
+
+
+@app.post("/sse")
+async def endpoint_sse_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+            status_code=200,
+        )
+
+    method = body.get("method", "")
+    req_id = body.get("id", 1)
+
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "simit-movilegal", "version": "4.8"},
+            },
+        })
+
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "tools": [{
+                    "name": "consultar_simit",
+                    "description": "Consulta comparendos y multas en SIMIT Colombia.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "documento": {"type": "string", "description": "Cédula o placa."},
+                        },
+                        "required": ["documento"],
+                    },
+                }],
+            },
+        })
+
+    elif method == "tools/call":
+        params = body.get("params", {})
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+
+        if tool_name != "consultar_simit":
+            return JSONResponse({
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32602, "message": f"Herramienta '{tool_name}' no existe."},
+            })
+
+        documento = arguments.get("documento", "").strip()
+        if not documento:
+            return JSONResponse({
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": "Necesito cédula o placa."}]},
+            })
+
+        resultado = await consultar_simit(documento)
+        texto = formatear_respuesta(resultado)
+
+        return JSONResponse({
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"content": [{"type": "text", "text": texto}]},
+        })
+
+    else:
+        return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
+
+
+@app.get("/debug-captcha")
+async def debug_captcha():
+    """Debug: llama a qxcaptcha endpoint=question con curl_cffi Chrome124 y retorna respuesta cruda."""
+    async with CurlSession(impersonate="chrome124") as curl:
+        try:
+            r = await curl.post(
+                CAPTCHA_URL,
+                data={"endpoint": "question"},
+                headers=CAPTCHA_HEADERS,
+                timeout=10,
+            )
+            body_data = r.json() if "application/json" in r.headers.get("content-type", "") else r.text
+            return JSONResponse({
+                "status_code": r.status_code,
+                "response_headers": dict(r.headers),
+                "cookies": dict(r.cookies),
+                "body": body_data,
+            })
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/debug/{documento}")
+async def debug_simit(documento: str):
+    """Debug: resultado crudo de consultar_simit con info del captcha."""
+    resultado = await consultar_simit(documento)
+    return JSONResponse(resultado)
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.8"}
+
+
+@app.get("/")
+async def raiz():
+    return {
+        "nombre": "SIMIT MCP Server - Movilegal",
+        "version": "4.8",
+        "algoritmo": "SHA256 + isPrime PoW — curl_cffi chrome124 para TODAS las requests",
+        "herramientas": ["consultar_simit"],
+        "conectar_en": "/sse",
+        "debug": "/debug/{cedula}",
+        "debug_captcha": "/debug-captcha",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(__import__("os").environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
