@@ -1,6 +1,6 @@
 """
 Servidor MCP - Consulta SIMIT Colombia
-Para Luisa de Movilegal en GPTmaker — v4.1
+Para Luisa de Movilegal en GPTmaker — v4.2
 
 Algoritmo de captcha reverse-engineered de captcha-worker.js:
 1. time = int(time.time())  [client-side]
@@ -107,7 +107,8 @@ def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -
 async def obtener_question(client: httpx.AsyncClient) -> dict:
     """
     Llama api.php con endpoint=question (FormData, igual que captcha.js).
-    Retorna {question, recommended_difficulty} o None si falla.
+    Retorna {question, recommended_difficulty, _headers} o {} si falla.
+    _headers incluye todos los headers de respuesta para debug de sesión/cookies.
     """
     try:
         r = await client.post(
@@ -119,7 +120,11 @@ async def obtener_question(client: httpx.AsyncClient) -> dict:
         if r.status_code == 200:
             data = r.json()
             if not data.get("error") and isinstance(data.get("data"), dict):
-                return data["data"]  # {question, recommended_difficulty}
+                resultado = data["data"]  # {question, recommended_difficulty}
+                # Guardar headers de respuesta para debug (cookies de sesión, etc.)
+                resultado["_headers"] = dict(r.headers)
+                resultado["_cookies"] = dict(r.cookies)
+                return resultado
     except Exception:
         pass
     return {}
@@ -161,6 +166,8 @@ async def consultar_simit(documento: str) -> dict:
             "captcha_time": captcha_time,
             "question": question,
             "difficulty": difficulty,
+            "captcha_headers": captcha_data.get("_headers", {}),
+            "captcha_cookies": captcha_data.get("_cookies", {}),
         }
 
         if not question:
@@ -200,7 +207,8 @@ async def consultar_simit(documento: str) -> dict:
             )
 
             raw_status = response.status_code
-            raw_text = response.text[:500]
+            raw_text = response.text[:1000]  # más caracteres para ver el error completo
+            simit_headers = dict(response.headers)
 
             if response.status_code == 200:
                 data = response.json()
@@ -219,6 +227,7 @@ async def consultar_simit(documento: str) -> dict:
                         **debug_info,
                         "status": raw_status,
                         "body_preview": raw_text,
+                        "simit_response_headers": simit_headers,
                     }
                 }
 
@@ -314,7 +323,7 @@ def formatear_respuesta(resultado: dict) -> str:
     return "\n".join(lineas)
 
 
-# ─── Servidor MCP ────────────────────────────────────────────────────────────
+# ─── Servidor MCP ─────────────────────────────────────────────────────────────
 
 mcp = Server("simit-movilegal")
 
@@ -405,7 +414,7 @@ async def endpoint_sse_post(request: Request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "simit-movilegal", "version": "4.1"}
+                "serverInfo": {"name": "simit-movilegal", "version": "4.2"}
             }
         })
 
@@ -457,6 +466,32 @@ async def endpoint_sse_post(request: Request):
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 
+@app.get("/debug-captcha")
+async def debug_captcha():
+    """
+    Endpoint de diagnóstico: llama a qxcaptcha endpoint=question y retorna
+    TODOS los headers de respuesta (especialmente Set-Cookie / PHPSESSID).
+    Sirve para entender si el captcha usa sesiones PHP.
+    """
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        try:
+            r = await client.post(
+                CAPTCHA_URL,
+                data={"endpoint": "question"},
+                headers=CAPTCHA_HEADERS,
+                timeout=10
+            )
+            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
+            return JSONResponse({
+                "status_code": r.status_code,
+                "response_headers": dict(r.headers),
+                "cookies": dict(r.cookies),
+                "body": body,
+            })
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/debug/{documento}")
 async def debug_simit(documento: str):
     """Debug endpoint — resultado crudo con info del captcha."""
@@ -466,18 +501,19 @@ async def debug_simit(documento: str):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.1"}
+    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.2"}
 
 
 @app.get("/")
 async def raiz():
     return {
         "nombre": "SIMIT MCP Server - Movilegal",
-        "version": "4.1",
+        "version": "4.2",
         "algoritmo": "SHA256 + isPrime proof-of-work optimizado (4x más rápido)",
         "herramientas": ["consultar_simit"],
         "conectar_en": "/sse",
         "debug": "/debug/{cedula}",
+        "debug_captcha_headers": "/debug-captcha",
     }
 
 
