@@ -19,10 +19,8 @@ from mcp.types import Tool, TextContent
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 
-# URL del API interno de SIMIT (sin captcha, sin login)
 SIMIT_URL = "https://consultasimit.fcm.org.co/simit/microservices/estado-cuenta-simit/estadocuenta/consulta"
 
-# Headers que simulan el navegador para que SIMIT acepte la petición
 SIMIT_HEADERS = {
     "Content-Type": "application/json",
     "Origin": "https://www.fcm.org.co",
@@ -32,7 +30,6 @@ SIMIT_HEADERS = {
     "Accept-Language": "es-CO,es;q=0.9,es-419;q=0.8",
 }
 
-# Formatos de body a intentar (SIMIT puede esperar diferentes nombres de campo)
 FORMATOS_BODY = [
     lambda doc: {"noIdentificacion": doc},
     lambda doc: {"numeroDocumento": doc},
@@ -45,82 +42,48 @@ FORMATOS_BODY = [
 # ─── Lógica de consulta SIMIT ─────────────────────────────────────────────────
 
 async def consultar_simit(documento: str) -> dict:
-    """
-    Consulta SIMIT con el número de cédula o placa.
-    Prueba varios formatos de body hasta encontrar el que funciona.
-    Retorna un dict con los resultados o un error.
-    """
     documento = documento.strip().upper()
-
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
         for formato in FORMATOS_BODY:
             body = formato(documento)
             try:
-                response = await client.post(
-                    SIMIT_URL,
-                    json=body,
-                    headers=SIMIT_HEADERS
-                )
+                response = await client.post(SIMIT_URL, json=body, headers=SIMIT_HEADERS)
                 if response.status_code == 200:
                     data = response.json()
-                    # Si retorna datos válidos, usamos este formato
                     if data is not None:
                         return {"exito": True, "datos": data, "documento": documento}
             except Exception:
-                continue  # Intentar el siguiente formato
-
-    return {
-        "exito": False,
-        "error": "No se pudo consultar SIMIT",
-        "documento": documento
-    }
+                continue
+    return {"exito": False, "error": "No se pudo consultar SIMIT", "documento": documento}
 
 
 def formatear_respuesta(resultado: dict) -> str:
-    """
-    Convierte la respuesta cruda de SIMIT en un texto claro
-    que Luisa puede leer y explicar al cliente.
-    """
     documento = resultado.get("documento", "")
-
-    # Si hubo error de conexión
     if not resultado.get("exito"):
         return (
             f"No pude consultar SIMIT para el documento {documento}. "
             f"El sistema puede estar caído. Intenta de nuevo en unos minutos."
         )
-
     datos = resultado.get("datos", {})
-
-    # Manejar respuesta vacía o sin deudas
     if not datos:
         return f"Cédula {documento}: sin comparendos ni multas registradas en SIMIT. Estado limpio."
 
-    # Extraer campos (SIMIT puede usar diferentes nombres según la versión)
     total_comparendos = (
-        datos.get("comparendos") or
-        datos.get("totalComparendos") or
-        datos.get("cantidadComparendos") or
-        len(datos.get("listaComparendos", [])) or 0
+        datos.get("comparendos") or datos.get("totalComparendos") or
+        datos.get("cantidadComparendos") or len(datos.get("listaComparendos", [])) or 0
     )
     total_multas = (
-        datos.get("multas") or
-        datos.get("totalMultas") or
-        datos.get("cantidadMultas") or
-        len(datos.get("listaMultas", [])) or 0
+        datos.get("multas") or datos.get("totalMultas") or
+        datos.get("cantidadMultas") or len(datos.get("listaMultas", [])) or 0
     )
     valor_total = (
-        datos.get("total") or
-        datos.get("valorTotal") or
-        datos.get("totalAPagar") or
-        datos.get("saldoTotal") or 0
+        datos.get("total") or datos.get("valorTotal") or
+        datos.get("totalAPagar") or datos.get("saldoTotal") or 0
     )
 
-    # Sin deudas
     if valor_total == 0 and total_comparendos == 0 and total_multas == 0:
         return f"Cédula {documento}: sin comparendos ni multas en SIMIT. Estado limpio."
 
-    # Con deudas — armar resumen
     lineas = [f"Consulta SIMIT - Documento {documento}:"]
     if total_comparendos:
         lineas.append(f"Comparendos: {total_comparendos}")
@@ -129,11 +92,10 @@ def formatear_respuesta(resultado: dict) -> str:
     if valor_total:
         lineas.append(f"Total a pagar: ${int(valor_total):,}")
 
-    # Agregar detalle de comparendos si está disponible
     lista = datos.get("listaComparendos", datos.get("comparendosList", []))
     if lista:
         lineas.append("Detalle:")
-        for item in lista[:5]:  # Máximo 5 para no saturar el mensaje
+        for item in lista[:5]:
             placa = item.get("placa", item.get("noPlaca", ""))
             estado = item.get("estado", item.get("estadoComparendo", ""))
             valor = item.get("valorAPagar", item.get("valor", 0))
@@ -147,13 +109,11 @@ def formatear_respuesta(resultado: dict) -> str:
 
 # ─── Servidor MCP ─────────────────────────────────────────────────────────────
 
-# Crear el servidor MCP con nombre identificable
 mcp = Server("simit-movilegal")
 
 
 @mcp.list_tools()
 async def listar_herramientas():
-    """Le dice a GPTmaker qué herramientas tiene disponibles este servidor."""
     return [
         Tool(
             name="consultar_simit",
@@ -167,10 +127,7 @@ async def listar_herramientas():
                 "properties": {
                     "documento": {
                         "type": "string",
-                        "description": (
-                            "Número de cédula de ciudadanía o placa del vehículo. "
-                            "Ejemplos: '1049615965' o 'KWX584'"
-                        )
+                        "description": "Número de cédula de ciudadanía o placa del vehículo. Ejemplos: '1049615965' o 'KWX584'"
                     }
                 },
                 "required": ["documento"]
@@ -181,19 +138,12 @@ async def listar_herramientas():
 
 @mcp.call_tool()
 async def ejecutar_herramienta(name: str, arguments: dict):
-    """Ejecuta la herramienta cuando Luisa la llama."""
     if name != "consultar_simit":
         return [TextContent(type="text", text=f"Herramienta '{name}' no existe en este servidor.")]
-
     documento = arguments.get("documento", "").strip()
-
     if not documento:
         return [TextContent(type="text", text="Necesito el número de cédula o placa para hacer la consulta.")]
-
-    # Hacer la consulta a SIMIT
     resultado = await consultar_simit(documento)
-
-    # Formatear y retornar
     texto = formatear_respuesta(resultado)
     return [TextContent(type="text", text=texto)]
 
@@ -202,7 +152,6 @@ async def ejecutar_herramienta(name: str, arguments: dict):
 
 app = FastAPI(title="SIMIT MCP - Movilegal")
 
-# CORS para que GPTmaker pueda conectarse sin problemas de origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -216,38 +165,21 @@ sse = SseServerTransport("/messages")
 
 @app.get("/sse")
 async def endpoint_sse(request: Request):
-    """
-    Punto de conexión principal para GPTmaker.
-    GPTmaker se conecta aquí vía Server-Sent Events.
-    """
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send
-    ) as (leer, escribir):
-        await mcp.run(
-            leer,
-            escribir,
-            mcp.create_initialization_options()
-        )
+    async with sse.connect_sse(request.scope, request.receive, request._send) as (leer, escribir):
+        await mcp.run(leer, escribir, mcp.create_initialization_options())
 
 
 @app.post("/messages")
 async def endpoint_mensajes(request: Request):
-    """Recibe mensajes de GPTmaker vía /messages."""
-    await sse.handle_post_message(
-        request.scope,
-        request.receive,
-        request._send
-    )
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
 
 @app.post("/sse")
 async def endpoint_sse_post(request: Request):
     """
-    GPTmaker valida el servidor haciendo POST /sse con JSON-RPC.
-    Respondemos directamente con JSON-RPC sin pasar por el SSE handler
-    (que causaba error ASGI de doble respuesta).
+    GPTmaker usa POST /sse para TODOS los mensajes MCP:
+    initialize, tools/list, y tools/call.
+    Manejamos cada método directamente sin SSE handler.
     """
     try:
         body = await request.json()
@@ -260,7 +192,7 @@ async def endpoint_sse_post(request: Request):
     method = body.get("method", "")
     req_id = body.get("id", 1)
 
-    # GPTmaker primero hace "initialize" para verificar el protocolo MCP
+    # Handshake inicial
     if method == "initialize":
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -272,7 +204,7 @@ async def endpoint_sse_post(request: Request):
             }
         })
 
-    # Luego consulta las herramientas disponibles
+    # Lista de herramientas disponibles
     elif method == "tools/list":
         return JSONResponse({
             "jsonrpc": "2.0",
@@ -291,10 +223,7 @@ async def endpoint_sse_post(request: Request):
                             "properties": {
                                 "documento": {
                                     "type": "string",
-                                    "description": (
-                                        "Número de cédula de ciudadanía o placa del vehículo. "
-                                        "Ejemplos: '1049615965' o 'KWX584'"
-                                    )
+                                    "description": "Número de cédula de ciudadanía o placa del vehículo. Ejemplos: '1049615965' o 'KWX584'"
                                 }
                             },
                             "required": ["documento"]
@@ -304,20 +233,49 @@ async def endpoint_sse_post(request: Request):
             }
         })
 
-    # Cualquier otro método — respuesta vacía válida
+    # Ejecución real de la herramienta — consulta SIMIT
+    elif method == "tools/call":
+        params = body.get("params", {})
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+
+        if tool_name != "consultar_simit":
+            return JSONResponse({
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32602, "message": f"Herramienta '{tool_name}' no existe."}
+            })
+
+        documento = arguments.get("documento", "").strip()
+        if not documento:
+            return JSONResponse({
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": "Necesito el número de cédula o placa para hacer la consulta."}]}
+            })
+
+        # Consulta real a SIMIT
+        resultado = await consultar_simit(documento)
+        texto = formatear_respuesta(resultado)
+
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": texto}]
+            }
+        })
+
+    # Cualquier otro método
     else:
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": {}})
 
 
 @app.get("/health")
 async def health_check():
-    """Railway usa este endpoint para saber si el servidor está vivo."""
     return {"status": "ok", "servidor": "SIMIT MCP - Movilegal"}
 
 
 @app.get("/")
 async def raiz():
-    """Página de inicio para confirmar que el servidor corre."""
     return {
         "nombre": "SIMIT MCP Server - Movilegal",
         "version": "1.0",
