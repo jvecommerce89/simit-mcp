@@ -1,19 +1,23 @@
 """
 Servidor MCP - Consulta SIMIT Colombia
-Para Luisa de Movilegal en GPTmaker — v4.4
+Para Luisa de Movilegal en GPTmaker — v4.5
 
 Algoritmo de captcha reverse-engineered de captcha-worker.js:
 1. time = int(time.time())  [client-side]
 2. POST api.php endpoint=question → retorna {datos: {pregunta, dificultad_recomendada}}
 3. Para i in range(difficulty):
    - Busca nonce (primo) tal que SHA256(JSON({question,time,nonce})).startswith("0000")
-   - verification.append({question, time, nonce})
-4. Envía verification como reCaptchaDTO.response (array) a SIMIT
+   - verification.append([question, time, nonce])  # ARRAY, no dict
+4. Envía verification como reCaptchaDTO.response (array de arrays) a SIMIT
 
 Fixes v4.4:
 - API devuelve "datos"/"pregunta"/"dificultad_recomendada" (español), no "data"/"question"
 - reCaptchaDTO.response se envía como array real (no string JSON)
 - consumidor como integer 1 (no string "1")
+
+Fix v4.5:
+- verify_array era dict {"question":..,"time":..,"nonce":..} — debe ser [question, time, nonce]
+  (JS hace: verification.push([question, time, nonce]) — array de arrays)
 """
 
 import os
@@ -93,7 +97,8 @@ def resolver_captcha(question: str, captcha_time: int, nonce_inicial: int = 1) -
 
         if hash_actual[:4] == "0000" and es_primo(nonce):
             return {
-                "verify_array": {"question": question, "time": captcha_time, "nonce": nonce},
+                # FIX v4.5: JS hace verification.push([question, time, nonce]) — array, no dict
+                "verify_array": [question, captcha_time, nonce],
                 "nonce": nonce,
                 "hash": hash_actual,
             }
@@ -499,7 +504,7 @@ async def debug_simit(documento: str):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.4"}
+    return {"status": "ok", "servidor": "SIMIT MCP - Movilegal v4.5"}
 
 
 @app.get("/")
@@ -515,8 +520,4 @@ async def raiz():
     }
 
 
-# ─── Arranque ─────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# ─── Arranque ───────────�
